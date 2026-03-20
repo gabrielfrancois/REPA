@@ -174,7 +174,7 @@ def main(args):
     lora_config = LoraConfig(
         r=16, lora_alpha=32, 
         target_modules=["qkv", "fc1", "fc2"], lora_dropout=0.05,
-        bias=None
+        bias="none"
         )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
