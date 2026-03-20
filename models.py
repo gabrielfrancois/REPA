@@ -236,7 +236,8 @@ class SiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        c = t + y                               # (N, D)
+        repa_h = None                             
         for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             if return_repa and i == repa_depth -1:
@@ -246,6 +247,8 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
+        if return_repa:
+            return x, repa_h
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
