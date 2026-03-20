@@ -42,10 +42,10 @@ class Projector(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(student_dim, teacher_dim),
             nn.SiLU(),
-            nn.Linear(teacher_dim, student_dim)
+            nn.Linear(teacher_dim, teacher_dim)
         )
     def forward(self, x):
-        eturn self.mlp(x)
+        return self.mlp(x)
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -147,7 +147,7 @@ def main(args):
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
-        experiment_name = f"{experiment_index:03d}-{model_string_name}-" \
+        experiment_name = f"{experiment_index:03d}-{model_string_name}-REPA" \
                         f"{args.path_type}-{args.prediction}-{args.loss_weight}"
         experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
@@ -191,6 +191,10 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
 
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
+    opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
+
     if args.ckpt is not None:
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
@@ -211,10 +215,6 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
-    opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
