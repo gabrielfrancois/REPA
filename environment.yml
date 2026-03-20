@@ -20,3 +20,4 @@ dependencies:
     - pillow
     - tqdm
     - datasets
+    - python-dotenv

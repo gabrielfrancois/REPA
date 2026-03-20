@@ -23,6 +23,8 @@ from time import time
 import argparse
 import logging
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 from models import SiT_models
 from download import find_model
