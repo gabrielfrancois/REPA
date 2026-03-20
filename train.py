@@ -179,13 +179,14 @@ def main(args):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    teacher = timm.create_model("vit_base_patch14_dinov2.lupa_in1k", pretrained=True).to(device)
+    teacher = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True).to(device)
+
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
     
     # Initialize Projector (MLP to match Student hidden dim to Teacher dim)
-    projector = Projector(model.module.hidden_size, teacher.embed_dim).to(device)
+    projector = Projector(model.hidden_size, teacher.embed_dim).to(device)
     
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -281,7 +282,7 @@ def main(args):
             with torch.no_grad():
                 # Get Teacher features from clean images and resize to 224x224 (DINOv2 standard)
                 x_teacher = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-                teacher_out = teacher.forward_features(x_teacher)["x_norm_patchtokens"] # (N, 256, 768)
+                teacher_out = teacher.forward_features(x_teacher)[:, 1:] # (N, 256, 768)
                 # Map input images to latent space + normalize latents:
                 x_latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
             #Standard Transport/Flow-Matching setup
