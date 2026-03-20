@@ -12,6 +12,8 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -235,7 +237,7 @@ class SiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             if return_repa and i == repa_depth -1:
                 repa_h = x
