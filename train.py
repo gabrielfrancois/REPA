@@ -30,11 +30,29 @@ from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
 import wandb_utils
+from peft import LoraConfig, get_peft_model
 
+import timm
+import torch.nn.functional as F
+import torch.nn as nn
+
+class Projector(nn.Module):
+    def __init__(self, student_dim, teacher_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(student_dim, teacher_dim),
+            nn.SiLU(),
+            nn.Linear(teacher_dim, student_dim)
+        )
+    def forward(self, x):
+        eturn self.mlp(x)
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 #################################################################################
 #                             Training Helper Functions                         #
-#################################################################################
+################################################################################# 
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -152,8 +170,26 @@ def main(args):
         num_classes=args.num_classes
     )
 
+    # Set up LoRA:
+    lora_config = LoraConfig(
+        r=16, lora_alpha=32, 
+        target_modules=["qkv", "fc1", "fc2"], lora_dropout=0.05,
+        bias=None
+        )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    teacher = timm.create_model("vit_base_patch14_dinov2.lupa_in1k", pretrained=True).to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    
+    # Initialize Projector (MLP to match Student hidden dim to Teacher dim)
+    projector = Projector(model.module.hidden_size, teacher.embed_dim).to(device)
+    
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
@@ -162,10 +198,9 @@ def main(args):
         ema.load_state_dict(state_dict["ema"])
         opt.load_state_dict(state_dict["opt"])
         args = state_dict["args"]
-
-    requires_grad(ema, False)
     
     model = DDP(model.to(device), device_ids=[device])
+    
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -178,7 +213,8 @@ def main(args):
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
+    opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -243,16 +279,33 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
+                # Get Teacher features from clean images and resize to 224x224 (DINOv2 standard)
+                x_teacher = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
+                teacher_out = teacher.forward_features(x_teacher)["x_norm_patchtokens"] # (N, 256, 768)
                 # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            model_kwargs = dict(y=y)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
+                x_latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            #Standard Transport/Flow-Matching setup
+            t, x0, x1 = transport.sample(x_latent)
+            t, xt, ut = transport.path_sampler.plan(t, x0, x1)
+            
+            # Forward Student (get prediction + intermediate hidden state)
+            model_output, student_h = model(xt, t, y=y, return_repa=True, repa_depth=8)
+
+            diff_loss = torch.mean((model_output - ut) ** 2)
+
+            # REPA Alignment Loss (Cosine Similarity)
+            student_proj = projector(student_h)
+            student_proj = F.normalize(student_proj, dim=-1)
+            teacher_out = F.normalize(teacher_out, dim=-1)
+            repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
+
+            lambda_repa = 0.5
+            loss = diff_loss + lambda_repa * repa_loss
+
             opt.zero_grad()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
-
+           
             # Log loss values:
             running_loss += loss.item()
             log_steps += 1
