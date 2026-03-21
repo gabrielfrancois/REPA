@@ -247,7 +247,7 @@ def main(args):
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    model.train()  # Enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
@@ -308,6 +308,7 @@ def main(args):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            update_ema(ema, model.module)
            
             # Log loss values:
             running_loss += loss.item()
@@ -345,6 +346,17 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+                    # --- ADDED: Rolling Checkpoint Cleanup ---
+                    # Find all .pt files and sort them by name (oldest first)
+                    saved_ckpts = sorted(glob(f"{checkpoint_dir}/*.pt"))
+                    # If we have more than 2, delete the oldest one
+                    while len(saved_ckpts) > 2:
+                        os.remove(saved_ckpts[0])
+                        logger.info(f"Deleted old checkpoint {saved_ckpts[0]} to free up disk space.")
+                        saved_ckpts.pop(0)
+                    # -----------------------------------------
+
                 dist.barrier()
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
@@ -372,6 +384,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    print("hello!!")
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
@@ -389,9 +402,9 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a custom SiT checkpoint")
+    parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a custom SiT checkpoint")
 
     parse_transport_args(parser)
     args = parser.parse_args()
     main(args)
+  
