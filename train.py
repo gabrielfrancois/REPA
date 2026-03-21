@@ -166,48 +166,65 @@ def main(args):
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+
+    # Init model
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
     )
+    
+    # LOAD CHECKPOINT BEFORE LORA/DDP 
+    if args.ckpt is not None:
+        state_dict = find_model(args.ckpt)
+        model.load_state_dict(state_dict["model"])
+        logger.info(f"Loaded base model checkpoint from {args.ckpt}")
 
-    # Set up LoRA, qkv=attention, fc1, fc2  = mlp:
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, 
-        target_modules=["qkv", "fc1", "fc2"], lora_dropout=0.05,
-        bias="none"
+    # OPTIONAL LORA SETUP
+    if args.with_lora:
+        lora_config = LoraConfig(
+            r=16, lora_alpha=32, 
+            target_modules=["qkv", "fc1", "fc2"], lora_dropout=0.05,
+            bias="none"
         )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-    teacher = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True).to(device)
+    # OPTIONAL REPA SETUP
+    if args.with_repa:
+        teacher = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True).to(device)
+        teacher.eval()
+        requires_grad(teacher, False)
+        
+        # Get hidden size safely whether wrapped in PEFT or not
+        hidden_size = model.base_model.model.hidden_size if args.with_lora else model.hidden_size
+        projector = Projector(hidden_size, teacher.embed_dim).to(device)
+    else:
+        teacher, projector = None, None
 
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-    
-    # Initialize Projector (MLP to match Student hidden dim to Teacher dim)
-    projector = Projector(model.hidden_size, teacher.embed_dim).to(device)
-    projector = DDP(projector, device_ids=[device])
-    
-    # Note that parameter initialization is done within the SiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    # EMA SETUP
+    ema = deepcopy(model).to(device)
     requires_grad(ema, False)
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
+    # Load EMA and Optimizer states ONLY if we are resuming the same training phase
+    if args.ckpt is not None and not args.with_lora:
+        if "ema" in state_dict:
+            ema.load_state_dict(state_dict["ema"])
+
+    # DDP WRAPPING (Before optimizer initialization)
     model = DDP(model.to(device), device_ids=[device])
+    if args.with_repa:
+        projector = DDP(projector, device_ids=[device])
+
+    # OPTIMIZER SETUP
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    if args.with_repa:
+        trainable_params += list(projector.parameters())
     opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
     
-    # scaler = torch.cuda.amp.GradScaler()
-
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
+    if args.ckpt is not None and not args.with_lora and "opt" in state_dict:
         opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
+
+    # scaler = torch.cuda.amp.GradScaler() # see afterward for other optimization
     
     transport = create_transport(
         args.path_type,
@@ -249,7 +266,7 @@ def main(args):
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # Enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    ema.eval()  # EMA model should always be in eval mode since only used for inference
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -265,15 +282,18 @@ def main(args):
     zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
     # Setup classifier-free guidance:
+    # Safely unwrap the EMA model if it's wrapped in LoRA
+    ema_unwrapped = ema.base_model.model if args.with_lora else ema
+
     if use_cfg:
         zs = torch.cat([zs, zs], 0)
         y_null = torch.tensor([1000] * n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        model_fn = ema.base_model.model.forward_with_cfg
+        model_fn = ema_unwrapped.forward_with_cfg
     else:
         sample_model_kwargs = dict(y=ys)
-        model_fn = ema.forward
+        model_fn = ema_unwrapped.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
@@ -283,28 +303,34 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                # Get Teacher features from clean images and resize to 224x224 (DINOv2 standard)
-                x_teacher = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-                teacher_out = teacher.forward_features(x_teacher)[:, 1:] # (N, 256, 768)
+                # Get Teacher features ONLY if doing REPA
+                if args.with_repa:
+                    x_teacher = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
+                    teacher_out = teacher.forward_features(x_teacher)[:, 1:] # (N, 256, 768)
+                
                 # Map input images to latent space + normalize latents:
                 x_latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            #Standard Transport/Flow-Matching setup
+            
+            # Standard Transport/Flow-Matching setup
             t, x0, x1 = transport.sample(x_latent)
             t, xt, ut = transport.path_sampler.plan(t, x0, x1)
             
-            # Forward Student (get prediction + intermediate hidden state)
-            model_output, student_h = model(xt, t, y=y, return_repa=True, repa_depth=8)
+            # Forward Student 
+            model_output, student_h = model(xt, t, y=y, return_repa=args.with_repa, repa_depth=8)
 
             diff_loss = torch.mean((model_output - ut) ** 2)
 
             # REPA Alignment Loss (Cosine Similarity)
-            student_proj = projector(student_h)
-            student_proj = F.normalize(student_proj, dim=-1)
-            teacher_out = F.normalize(teacher_out, dim=-1)
-            repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
+            if args.with_repa:
+                student_proj = projector(student_h)
+                student_proj = F.normalize(student_proj, dim=-1)
+                teacher_out = F.normalize(teacher_out, dim=-1)
+                repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
 
-            lambda_repa = 0.5
-            loss = diff_loss + lambda_repa * repa_loss
+                lambda_repa = 0.5
+                loss = diff_loss + lambda_repa * repa_loss
+            else:
+                loss = diff_loss
 
             opt.zero_grad()
             loss.backward()
@@ -348,15 +374,12 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-                    # --- ADDED: Rolling Checkpoint Cleanup ---
                     # Find all .pt files and sort them by name (oldest first)
                     saved_ckpts = sorted(glob(f"{checkpoint_dir}/*.pt"))
-                    # If we have more than 2, delete the oldest one
                     while len(saved_ckpts) > 2:
                         os.remove(saved_ckpts[0])
                         logger.info(f"Deleted old checkpoint {saved_ckpts[0]} to free up disk space.")
                         saved_ckpts.pop(0)
-                    # -----------------------------------------
 
                 dist.barrier()
             
@@ -403,6 +426,8 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a custom SiT checkpoint")
+    parser.add_argument("--with-lora", action="store_true", help="Enable LoRA fine-tuning")
+    parser.add_argument("--with-repa", action="store_true", help="Enable REPA alignment loss")
 
     parse_transport_args(parser)
     args = parser.parse_args()
