@@ -10,7 +10,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -55,6 +55,27 @@ def modulate(x, shift, scale):
 #################################################################################
 #                             Training Helper Functions                         #
 ################################################################################# 
+
+class PrecomputedDataset(Dataset):
+    def __init__(self, root):
+        self.root = root
+        self.classes = sorted(entry.name for entry in os.scandir(root) if entry.is_dir())
+        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
+        self.samples = []
+        for target_class in sorted(self.class_to_idx.keys()):
+            class_index = self.class_to_idx[target_class]
+            target_dir = os.path.join(root, target_class)
+            for fname in sorted(os.listdir(target_dir)):
+                if fname.endswith('.pt'):
+                    self.samples.append((os.path.join(target_dir, fname), class_index))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        return data["latent"], data["repa"], target
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -190,10 +211,10 @@ def main(args):
         model.print_trainable_parameters()
 
     # OPTIONAL REPA SETUP
-    if args.with_repa:
-        teacher = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True).to(device)
-        teacher.eval()
-        requires_grad(teacher, False)
+    # if args.with_repa:
+    #     teacher = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True, dynamic_img_size=True).to(device)
+    #     teacher.eval()
+    #     requires_grad(teacher, False)
         
         # Get hidden size safely whether wrapped in PEFT or not
         hidden_size = model.base_model.model.hidden_size if args.with_lora else model.hidden_size
@@ -234,7 +255,7 @@ def main(args):
         args.sample_eps
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup data:
@@ -244,7 +265,9 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    # dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = PrecomputedDataset(args.data_path)
+
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -299,35 +322,29 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
+        for x_latent, teacher_out, y in loader:
+            # Move pre-computed tensors to GPU
+            x_latent = x_latent.to(device)
             y = y.to(device)
-            with torch.no_grad():
-                # Get Teacher features ONLY if doing REPA
-                if args.with_repa:
-                    x_teacher = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-                    teacher_out = teacher.forward_features(x_teacher)[:, 1:] # (N, 256, 768)
-                
-                # Map input images to latent space + normalize latents:
-                x_latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            
+            if args.with_repa:
+                teacher_out = teacher_out.to(device)
+
             # Standard Transport/Flow-Matching setup
-            t, x0, x1 = transport.sample(x_latent)
-            t, xt, ut = transport.path_sampler.plan(t, x0, x1)
+            with torch.no_grad():
+                t, x0, x1 = transport.sample(x_latent)
+                t, xt, ut = transport.path_sampler.plan(t, x0, x1)
             
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 # Forward Student 
                 model_output, student_h = model(xt, t, y=y, return_repa=args.with_repa, repa_depth=8)
-
                 diff_loss = torch.mean((model_output - ut) ** 2)
 
                 # REPA Alignment Loss (Cosine Similarity)
                 if args.with_repa:
                     student_proj = projector(student_h)
                     student_proj = F.normalize(student_proj, dim=-1)
-                    teacher_out = F.normalize(teacher_out, dim=-1)
+                    teacher_out = F.normalize(teacher_out, dim=-1) # Teacher out is already loaded
                     repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
-
                     lambda_repa = 0.5
                     loss = diff_loss + lambda_repa * repa_loss
                 else:
