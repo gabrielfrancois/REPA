@@ -224,7 +224,7 @@ def main(args):
     if args.ckpt is not None and not args.with_lora and "opt" in state_dict:
         opt.load_state_dict(state_dict["opt"])
 
-    # scaler = torch.cuda.amp.GradScaler() # see afterward for other optimization
+    scaler = torch.cuda.amp.GradScaler() # see afterward for other optimization
     
     transport = create_transport(
         args.path_type,
@@ -315,26 +315,28 @@ def main(args):
             t, x0, x1 = transport.sample(x_latent)
             t, xt, ut = transport.path_sampler.plan(t, x0, x1)
             
-            # Forward Student 
-            model_output, student_h = model(xt, t, y=y, return_repa=args.with_repa, repa_depth=8)
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                # Forward Student 
+                model_output, student_h = model(xt, t, y=y, return_repa=args.with_repa, repa_depth=8)
 
-            diff_loss = torch.mean((model_output - ut) ** 2)
+                diff_loss = torch.mean((model_output - ut) ** 2)
 
-            # REPA Alignment Loss (Cosine Similarity)
-            if args.with_repa:
-                student_proj = projector(student_h)
-                student_proj = F.normalize(student_proj, dim=-1)
-                teacher_out = F.normalize(teacher_out, dim=-1)
-                repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
+                # REPA Alignment Loss (Cosine Similarity)
+                if args.with_repa:
+                    student_proj = projector(student_h)
+                    student_proj = F.normalize(student_proj, dim=-1)
+                    teacher_out = F.normalize(teacher_out, dim=-1)
+                    repa_loss = - (student_proj * teacher_out).sum(dim=-1).mean()
 
-                lambda_repa = 0.5
-                loss = diff_loss + lambda_repa * repa_loss
-            else:
-                loss = diff_loss
+                    lambda_repa = 0.5
+                    loss = diff_loss + lambda_repa * repa_loss
+                else:
+                    loss = diff_loss
 
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             update_ema(ema, model.module)
            
             # Log loss values:
