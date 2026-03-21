@@ -1,7 +1,8 @@
 __pycache__
 wandb
-
 .DS_store
 samples
 results
 pretrained_models
+results_repa/
+data/
