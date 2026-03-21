@@ -133,7 +133,7 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
+    # Setup DDP (DistributedSampler for NVIDIA GPU optimization):
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
@@ -156,7 +156,6 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
-
         entity = os.environ["ENTITY"]
         project = os.environ["PROJECT"]
         if args.wandb:
@@ -172,7 +171,7 @@ def main(args):
         num_classes=args.num_classes
     )
 
-    # Set up LoRA:
+    # Set up LoRA, qkv=attention, fc1, fc2  = mlp:
     lora_config = LoraConfig(
         r=16, lora_alpha=32, 
         target_modules=["qkv", "fc1", "fc2"], lora_dropout=0.05,
@@ -199,6 +198,8 @@ def main(args):
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
     model = DDP(model.to(device), device_ids=[device])
     opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
+    
+    # scaler = torch.cuda.amp.GradScaler()
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
@@ -392,7 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
