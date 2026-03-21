@@ -129,7 +129,7 @@ def center_crop_arr(pil_image, image_size):
 
 def main(args):
     """
-    Trains a new SiT model.
+    Trains a new SiT model (with REPA).
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -189,6 +189,7 @@ def main(args):
     
     # Initialize Projector (MLP to match Student hidden dim to Teacher dim)
     projector = Projector(model.hidden_size, teacher.embed_dim).to(device)
+    projector = DDP(projector, device_ids=[device])
     
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -196,6 +197,7 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(projector.parameters())
+    model = DDP(model.to(device), device_ids=[device])
     opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
 
     if args.ckpt is not None:
@@ -205,8 +207,6 @@ def main(args):
         ema.load_state_dict(state_dict["ema"])
         opt.load_state_dict(state_dict["opt"])
         args = state_dict["args"]
-    
-    model = DDP(model.to(device), device_ids=[device])
     
     transport = create_transport(
         args.path_type,
@@ -269,7 +269,7 @@ def main(args):
         y_null = torch.tensor([1000] * n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        model_fn = ema.forward_with_cfg
+        model_fn = ema.base_model.model.forward_with_cfg
     else:
         sample_model_kwargs = dict(y=ys)
         model_fn = ema.forward
@@ -384,7 +384,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    print("hello!!")
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
