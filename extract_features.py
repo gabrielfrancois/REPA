@@ -58,8 +58,8 @@ def main():
         x_latent = vae.encode(x).latent_dist.sample().mul_(0.18215) # (B, 4, 32, 32)
 
         # save to disk (move to CPU to save)
-        teacher_out = teacher_out.cpu()
-        x_latent = x_latent.cpu()
+        teacher_out = teacher_out.to(torch.float16).cpu().half()
+        x_latent = x_latent.to(torch.float16).cpu().half()
         y = y.cpu()
 
         for i in range(x.shape[0]):
